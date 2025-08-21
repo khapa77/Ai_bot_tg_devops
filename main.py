@@ -20,12 +20,24 @@ from contextlib import suppress
 # Перед запуском установите переменные окружения BOT_TOKEN (токен Telegram) и OPENAI_API_KEY (ключ OpenAI)
 """Чтение секретов из файлов проекта и/или переменных окружения."""
 
+# Папка с секретами
+SECRETS_DIR = os.environ.get("SECRETS_DIR", "secrets")
+
 def _read_secret_file(filename):
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base_dir, filename)
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
+        # Сначала ищем в папке секретов
+        secrets_path = os.path.join(base_dir, SECRETS_DIR, filename)
+        if os.path.exists(secrets_path):
+            with open(secrets_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    value = line.strip()
+                    if value:
+                        return value
+        # Fallback: корень проекта для обратной совместимости
+        legacy_path = os.path.join(base_dir, filename)
+        if os.path.exists(legacy_path):
+            with open(legacy_path, "r", encoding="utf-8") as f:
                 for line in f:
                     value = line.strip()
                     if value:
