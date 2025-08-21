@@ -58,7 +58,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация AI клиента с системным промтом
+# Инициализация AI клиентов с системным промтом
 _openai_key_from_file = _read_secret_file("OpenAI_API")
 OPENAI_API_KEY = _openai_key_from_file or os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -72,6 +72,16 @@ _openai_org_from_file = _read_secret_file("OpenAI_ORG")
 OPENAI_ORG = _openai_org_from_file or os.environ.get("OPENAI_ORG")
 
 ai_client = OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT, organization=OPENAI_ORG)  # ✅
+
+# DeepSeek (опционально)
+_deepseek_key_from_file = _read_secret_file("DeepSeek_API")
+DEEPSEEK_API_KEY = _deepseek_key_from_file or os.environ.get("DEEPSEEK_API_KEY")
+deepseek_client = None
+if DEEPSEEK_API_KEY:
+    try:
+        deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+    except Exception as e:
+        logger.warning(f"Не удалось инициализировать DeepSeek клиент: {e}")
 
 default_system_prompt = """Ты — senior-админ и преподаватель с экспертизой в Linux, TCP/IP и Netflow. Твои ответы должны быть:
 
@@ -98,6 +108,7 @@ default_system_prompt = """Ты — senior-админ и преподавате�
 PROMPTS = []  # список словарей: {id, title, content}
 PROMPT_BY_ID = {}
 USER_SELECTED_PROMPT = {}  # user_id -> prompt_id
+USER_AI_PROVIDER = {}  # user_id -> 'OPEN_AI' | 'DEEP_SEEK'
 
 # Совместимость для старых Python без asyncio.to_thread
 try:
@@ -108,6 +119,14 @@ except AttributeError:  # Python < 3.9
     async def _to_thread(func, *args, **kwargs):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_compat_executor, lambda: func(*args, **kwargs))
+
+def _is_region_block_error(err: Exception) -> bool:
+    text = str(err).lower()
+    return (
+        "unsupported_country_region_territory" in text or
+        "request_forbidden" in text or
+        "403" in text and "openai" in text
+    )
 
 def _fix_json_multiline_strings(text: str) -> str:
     """Грубая попытка исправить многострочные строки в JSON для ключей title/content.
@@ -177,6 +196,27 @@ def _get_user_system_prompt(user_id: int) -> str:
     if pid and pid in PROMPT_BY_ID:
         return PROMPT_BY_ID[pid]["content"]
     return default_system_prompt
+
+def _get_user_ai_provider(user_id: int) -> str:
+    provider = USER_AI_PROVIDER.get(user_id)
+    if provider in ("OPEN_AI", "DEEP_SEEK"):
+        return provider
+    return "OPEN_AI"
+
+def _get_client_and_model(user_id: int, vision: bool = False):
+    provider = _get_user_ai_provider(user_id)
+    if provider == "DEEP_SEEK":
+        if not deepseek_client:
+            raise RuntimeError("DeepSeek не настроен: задайте ключ в файле DeepSeek_API или переменной DEEPSEEK_API_KEY")
+        model = "deepseek-chat"  # базовая модель чата DeepSeek
+        if vision:
+            # На текущий момент Vision может быть недоступен у DeepSeek
+            return deepseek_client, model, False
+        return deepseek_client, model, True
+    # OPEN_AI по умолчанию
+    if vision:
+        return ai_client, "gpt-4-vision-preview", True
+    return ai_client, "gpt-4-turbo", True
 
 # PDF отчёты (опционально, через reportlab)
 try:
@@ -305,12 +345,9 @@ def _generate_admin_report_pdf() -> str:
     return file_path
 
 async def get_ai_response(messages: list) -> str:
-    response = await _to_thread(
-        ai_client.chat.completions.create,
-        model="gpt-4-turbo",
-        messages=messages,
-        temperature=0.7
-    )
+    # Выбор клиента/модели на основе первого сообщения system, далее по user_id будет корректнее
+    # Здесь уточнение идёт в вызывающих местах — мы туда передадим user_id для маршрутизации.
+    raise RuntimeError("get_ai_response используется через get_ai_response_for_user")
     return response.choices[0].message.content
 
 
@@ -319,15 +356,24 @@ async def get_ai_response(messages: list) -> str:
 # А системный промт передавайте в messages через _get_user_system_prompt
 
 
-# Кэш для ответов (асинхронный, по tuple сообщений)
+# Кэш для ответов (асинхронный, по tuple сообщений и провайдеру)
 ai_response_cache = {}
 
-async def get_cached_ai_response(messages: list) -> str:
-    # Ключ — tuple из (role, content) для каждого сообщения
-    cache_key = tuple((msg['role'], msg['content']) for msg in messages)
+async def get_cached_ai_response_for_user(user_id: int, messages: list) -> str:
+    client, model, supported = _get_client_and_model(user_id, vision=False)
+    # Ключ — провайдер+модель + tuple из (role, content) для каждого сообщения
+    cache_key = (model, tuple((msg['role'], msg['content']) for msg in messages))
     if cache_key in ai_response_cache:
         return ai_response_cache[cache_key]
-    response = await get_ai_response(messages)
+    if not supported:
+        raise RuntimeError("Выбранный провайдер не поддерживает чат-модели")
+    response_obj = await _to_thread(
+        client.chat.completions.create,
+        model=model,
+        messages=messages,
+        temperature=0.7
+    )
+    response = response_obj.choices[0].message.content
     ai_response_cache[cache_key] = response
     return response
 
@@ -363,7 +409,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 [KeyboardButton("💬 Задать вопрос"), KeyboardButton("🧠 Выбрать промпт")],
                 [KeyboardButton("📊 Статистика"), KeyboardButton("🧹 Сброс контекста")],
-                [KeyboardButton("📄 Мой отчет")]
+                [KeyboardButton("🤖 Выбрать AI"), KeyboardButton("📄 Мой отчет")]
             ],
             resize_keyboard=True
         )
@@ -380,7 +426,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             [KeyboardButton("💬 Задать вопрос"), KeyboardButton("🧠 Выбрать промпт")],
             [KeyboardButton("📊 Статистика"), KeyboardButton("🧹 Сброс контекста")],
-            [KeyboardButton("📄 Мой отчет")]
+            [KeyboardButton("🤖 Выбрать AI"), KeyboardButton("📄 Мой отчет")]
         ],
         resize_keyboard=True
     )
@@ -392,6 +438,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — приветствие и меню\n"
         "/menu — показать меню\n"
         "/prompt — выбрать системный промпт\n"
+        "/ai — выбрать AI провайдера (OpenAI / DeepSeek)\n"
         "/myreport — PDF отчет для пользователя\n"
         "/report — PDF отчет для админа\n"
         "/reload_prompts — перезагрузить список промптов (админ)\n"
@@ -436,6 +483,8 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (update.message.text or "").strip()
     if text == "🧠 Выбрать промпт":
         return await prompt_menu(update, context)
+    if text == "🤖 Выбрать AI":
+        return await ai_menu(update, context)
     if text == "📊 Статистика":
         # Покажем краткую статистику
         stats_text = (
@@ -469,15 +518,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_contexts[user_id].append({"role": "user", "content": user_message})
     user_contexts[user_id] = user_contexts[user_id][-HISTORY_LENGTH:]
     
-    # Формируем messages для OpenAI с учётом выбранного промпта
+    # Формируем messages с учётом выбранного промпта и провайдера
     system_prompt_text = _get_user_system_prompt(user_id)
     messages = [{"role": "system", "content": system_prompt_text}] + user_contexts[user_id]
     
     try:
         logger.info(f"Processing message from {user_id}: {user_message}")
         
-        # Получаем ответ (из кэша или API)
-        ai_response = await get_cached_ai_response(messages)
+        # Получаем ответ (из кэша или API), учитывая выбранного провайдера
+        ai_response = await get_cached_ai_response_for_user(user_id, messages)
         
         # Добавляем ответ в контекст
         user_contexts[user_id].append({"role": "assistant", "content": ai_response})
@@ -489,8 +538,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(ai_response, reply_markup=reply_markup)
         
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        await update.message.reply_text("Извините, произошла ошибка. Попробуйте позже.")
+        if _is_region_block_error(e):
+            logger.error(f"OpenAI region restriction: {e}")
+            await update.message.reply_text(
+                "Доступ к OpenAI ограничен в вашем регионе. Варианты:\n"
+                "- Запустите бота на хосте в поддерживаемом регионе\n"
+                "- Используйте Azure OpenAI (потребуется другой клиент/ключ)"
+            )
+        else:
+            logger.error(f"Error processing message: {e}")
+            await update.message.reply_text("Извините, произошла ошибка. Попробуйте позже.")
 
 async def analyze_image_with_openai(image_path: str) -> str:
     # Используем OpenAI Vision (gpt-4-vision-preview)
@@ -528,9 +585,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_prompt = _get_user_system_prompt(user.id)
         with open(image_path, "rb") as img_file:
             content_bytes = img_file.read()
+        client, model, supported = _get_client_and_model(user.id, vision=True)
+        if not supported:
+            raise RuntimeError("Выбранный провайдер не поддерживает анализ изображений")
         response_obj = await _to_thread(
-            ai_client.chat.completions.create,
-            model="gpt-4-vision-preview",
+            client.chat.completions.create,
+            model=model,
             messages=[
                 {"role": "system", "content": user_prompt},
                 {"role": "user", "content": "Что на этом изображении?", "image": content_bytes}
@@ -542,8 +602,14 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(image_path)
         await update.message.reply_text(response)
     except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        await update.message.reply_text("Не удалось обработать изображение.")
+        if _is_region_block_error(e):
+            logger.error(f"OpenAI region restriction: {e}")
+            await update.message.reply_text(
+                "Доступ к OpenAI ограничен в вашем регионе. Перенесите запуск бота в поддерживаемый регион или используйте Azure OpenAI."
+            )
+        else:
+            logger.error(f"Error processing image: {e}")
+            await update.message.reply_text("Не удалось обработать изображение.")
 
 # Админ-панель
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -596,6 +662,24 @@ async def prompt_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка формирования меню промптов: {e}")
         await update.message.reply_text("Не удалось загрузить список промптов.")
 
+async def ai_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        keyboard = []
+        current = _get_user_ai_provider(user_id)
+        # OpenAI всегда доступен
+        prefix_oa = "✅ " if current == "OPEN_AI" else ""
+        keyboard.append([InlineKeyboardButton(f"{prefix_oa}OpenAI", callback_data="set_ai:OPEN_AI")])
+        # DeepSeek — только если настроен ключ
+        if deepseek_client is not None:
+            prefix_ds = "✅ " if current == "DEEP_SEEK" else ""
+            keyboard.append([InlineKeyboardButton(f"{prefix_ds}DeepSeek", callback_data="set_ai:DEEP_SEEK")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Выберите AI провайдера:", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка формирования меню AI: {e}")
+        await update.message.reply_text("Не удалось загрузить список провайдеров.")
+
 async def set_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -614,6 +698,27 @@ async def set_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Ошибка выбора промпта: {e}")
         await query.edit_message_text("Не удалось применить промпт.")
+
+async def set_ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        data = query.data
+        if not data.startswith("set_ai:"):
+            return
+        provider = data.split(":", 1)[1]
+        user_id = query.from_user.id
+        if provider not in ("OPEN_AI", "DEEP_SEEK"):
+            await query.edit_message_text("Неизвестный провайдер.")
+            return
+        if provider == "DEEP_SEEK" and deepseek_client is None:
+            await query.edit_message_text("DeepSeek не настроен. Добавьте ключ DEEPSEEK_API_KEY.")
+            return
+        USER_AI_PROVIDER[user_id] = provider
+        await query.edit_message_text(f"Выбран AI провайдер: {'OpenAI' if provider=='OPEN_AI' else 'DeepSeek'}")
+    except Exception as e:
+        logger.error(f"Ошибка выбора AI: {e}")
+        await query.edit_message_text("Не удалось применить провайдера.")
 
 async def save_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -754,6 +859,7 @@ def main():
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(set_prompt_callback, pattern=r"^set_prompt:"))
     application.add_handler(CallbackQueryHandler(save_pdf_callback, pattern=r"^save_pdf$"))
+    application.add_handler(CallbackQueryHandler(set_ai_callback, pattern=r"^set_ai:"))
     
     # Обработчик ошибок
     application.add_error_handler(error_handler)
