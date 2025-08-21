@@ -99,6 +99,16 @@ PROMPTS = []  # список словарей: {id, title, content}
 PROMPT_BY_ID = {}
 USER_SELECTED_PROMPT = {}  # user_id -> prompt_id
 
+# Совместимость для старых Python без asyncio.to_thread
+try:
+    _to_thread = asyncio.to_thread  # type: ignore[attr-defined]
+except AttributeError:  # Python < 3.9
+    from concurrent.futures import ThreadPoolExecutor
+    _compat_executor = ThreadPoolExecutor(max_workers=4)
+    async def _to_thread(func, *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_compat_executor, lambda: func(*args, **kwargs))
+
 def _fix_json_multiline_strings(text: str) -> str:
     """Грубая попытка исправить многострочные строки в JSON для ключей title/content.
     Заменяет реальные переводы строк внутри кавычек на символы \n.
@@ -295,7 +305,7 @@ def _generate_admin_report_pdf() -> str:
     return file_path
 
 async def get_ai_response(messages: list) -> str:
-    response = await asyncio.to_thread(
+    response = await _to_thread(
         ai_client.chat.completions.create,
         model="gpt-4-turbo",
         messages=messages,
@@ -488,7 +498,7 @@ async def analyze_image_with_openai(image_path: str) -> str:
         # Для простоты используем текущий промпт без привязки к пользователю в этом helper.
         # Выбор промпта учитывается в handle_image ниже посредством user_id.
         content_bytes = img_file.read()
-        response = await asyncio.to_thread(
+        response = await _to_thread(
             ai_client.chat.completions.create,
             model="gpt-4-vision-preview",
             messages=[
@@ -518,7 +528,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_prompt = _get_user_system_prompt(user.id)
         with open(image_path, "rb") as img_file:
             content_bytes = img_file.read()
-        response_obj = await asyncio.to_thread(
+        response_obj = await _to_thread(
             ai_client.chat.completions.create,
             model="gpt-4-vision-preview",
             messages=[
@@ -709,7 +719,7 @@ def main():
     
     # Инициализируем список промптов
     _load_prompts()
-
+    
     # Создаем Application
     application = Application.builder().token(BOT_TOKEN).build()
     
