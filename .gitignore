@@ -1,0 +1,8 @@
+# Ignore files:
+
+agent
+DeepSeek_API_back
+OpenAI_API_back
+secrets/*API
+temp_images
+temp_reports
