@@ -64,6 +64,8 @@ HISTORY_LENGTH = 5  # Количество сообщений для конте�
 ADMIN_MENU, VIEW_STATS, BROADCAST = range(3)
 # Состояния для добавления промпта
 PROMPT_ADD_TITLE, PROMPT_ADD_CONTENT = range(100, 102)
+# Состояние для пользовательского промпта (без шаблонов)
+CUSTOM_PROMPT = 200
 
 # Настройка логгирования
 logging.basicConfig(
@@ -246,10 +248,18 @@ def _save_prompts() -> None:
     except Exception as e:
         logger.error(f"Не удалось сохранить promt_list: {e}")
 
-def _get_user_system_prompt(user_id: int) -> str:
+def _get_user_system_prompt(user_id: int, context: ContextTypes.DEFAULT_TYPE = None) -> str:
     pid = USER_SELECTED_PROMPT.get(user_id)
+    
+    # Если выбран пользовательский промпт, возвращаем его
+    if pid == "custom" and context and "custom_prompt" in context.user_data:
+        return context.user_data["custom_prompt"]
+    
+    # Если выбран стандартный промпт из списка
     if pid and pid in PROMPT_BY_ID:
         return PROMPT_BY_ID[pid]["content"]
+    
+    # По умолчанию возвращаем дефолтный промпт
     return default_system_prompt
 
 def _get_user_ai_provider(user_id: int) -> str:
@@ -501,16 +511,25 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Доступные команды:\n"
-        "/start — приветствие и меню\n"
+        "🤖 Доступные команды:\n\n"
+        "💬 Основные:\n"
+        "/start — приветствие и главное меню\n"
         "/menu — показать меню\n"
+        "/help — показать эту справку\n\n"
+        "🧠 Промпты и AI:\n"
         "/prompt — выбрать системный промпт\n"
-        "/ai — выбрать AI провайдера (OpenAI / DeepSeek)\n"
+        "/ai — выбрать AI провайдера (OpenAI / DeepSeek)\n\n"
+        "💬 Взаимодействие:\n"
+        "/question — задать вопрос (аналог кнопки)\n"
+        "/stats — показать статистику (аналог кнопки)\n\n"
+        "📊 Отчеты:\n"
         "/myreport — PDF отчет для пользователя\n"
-        "/report — PDF отчет для админа\n"
+        "/report — PDF отчет для админа\n\n"
+        "⚙️ Администрирование:\n"
+        "/reset — очистить контекст диалога\n"
         "/reload_prompts — перезагрузить список промптов (админ)\n"
-        "/admin — админ-панель\n"
-        "/reset — очистить контекст диалога"
+        "/admin — админ-панель\n\n"
+        "📋 Также доступны кнопки в главном меню!"
     )
 
 async def reset_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -546,26 +565,45 @@ async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка генерации админского отчёта: {e}")
         await update.message.reply_text("Не удалось создать PDF отчет.")
 
+async def question_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /question - аналог кнопки '💬 Задать вопрос'"""
+    await update.message.reply_text("Напишите свой вопрос сообщением ниже.")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /stats - аналог кнопки '📊 Статистика'"""
+    stats_text = (
+        f"📊 Статистика бота:\n"
+        f"• Всего сообщений: {bot_stats['total_messages']}\n"
+        f"• Уникальных пользователей: {len(bot_stats['active_users'])}"
+    )
+    await update.message.reply_text(stats_text)
+
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    
+    # Обработка ввода одиночного "/"
+    if text == "/":
+        await update.message.reply_text(
+            "🤖 Введите команду:\n"
+            "/start - приветствие и меню\n"
+            "/help - показать все команды\n"
+            "/menu - главное меню\n\n"
+            "Или используйте кнопки ниже 👇"
+        )
+        return
+    
     if text == "🧠 Выбрать промпт":
         return await prompt_menu(update, context)
     if text == "🤖 Выбрать AI":
         return await ai_menu(update, context)
     if text == "📊 Статистика":
-        # Покажем краткую статистику
-        stats_text = (
-            f"📊 Статистика бота:\n"
-            f"• Всего сообщений: {bot_stats['total_messages']}\n"
-            f"• Уникальных пользователей: {len(bot_stats['active_users'])}"
-        )
-        return await update.message.reply_text(stats_text)
+        return await stats_cmd(update, context)
     if text == "🧹 Сброс контекста":
         return await reset_context(update, context)
     if text == "📄 Мой отчет":
         return await my_report(update, context)
     if text == "💬 Задать вопрос":
-        return await update.message.reply_text("Напишите свой вопрос сообщением ниже.")
+        return await question_cmd(update, context)
     # иначе — пропускаем дальше к обычной обработке текста
     return await handle_text(update, context)
 
@@ -621,7 +659,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_contexts[user_id] = user_contexts[user_id][-HISTORY_LENGTH:]
     
     # Формируем messages с учётом выбранного промпта и провайдера
-    system_prompt_text = _get_user_system_prompt(user_id)
+    system_prompt_text = _get_user_system_prompt(user_id, context)
     messages = [{"role": "system", "content": system_prompt_text}] + user_contexts[user_id]
     
     try:
@@ -835,9 +873,36 @@ async def set_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             if query.from_user.id not in ADMIN_IDS:
                 await query.edit_message_text("Доступ запрещен.")
                 return
+            # Предлагаем выбор: добавить в список или использовать как пользовательский промпт
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить в список промптов", callback_data="prompt_admin:add_to_list")],
+                [InlineKeyboardButton("🧠 Использовать как пользовательский промпт", callback_data="prompt_admin:use_custom")]
+            ]
+            await query.edit_message_text(
+                "Выберите действие:\n\n"
+                "➕ Добавить в список - добавит новый промпт в файл promt_list\n"
+                "🧠 Использовать как пользовательский - отключит шаблоны и будет использовать ваш ввод как промпт",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        if data == "prompt_admin:add_to_list":
+            if query.from_user.id not in ADMIN_IDS:
+                await query.edit_message_text("Доступ запрещен.")
+                return
             await query.edit_message_text("Введите заголовок нового промпта (title):")
             context.user_data["prompt_admin_action"] = "add_title"
             return
+        if data == "prompt_admin:use_custom":
+            if query.from_user.id not in ADMIN_IDS:
+                await query.edit_message_text("Доступ запрещен.")
+                return
+            await query.edit_message_text(
+                "📝 Режим пользовательского промпта активирован!\n\n"
+                "Теперь все ваши сообщения будут использоваться как системный промпт. "
+                "Шаблоны из файла promt_list отключены.\n\n"
+                "Отправьте ваш промпт сообщением:"
+            )
+            return CUSTOM_PROMPT
         if data == "prompt_admin:del":
             if query.from_user.id not in ADMIN_IDS:
                 await query.edit_message_text("Доступ запрещен.")
@@ -883,6 +948,25 @@ async def set_ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка выбора AI: {e}")
         await query.edit_message_text("Не удалось применить провайдера.")
+
+async def handle_custom_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик пользовательского промпта (без шаблонов)"""
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    
+    # Сохраняем пользовательский промпт
+    USER_SELECTED_PROMPT[user_id] = "custom"
+    # Сохраняем контент промпта в user_data для использования
+    context.user_data["custom_prompt"] = user_message
+    
+    await update.message.reply_text(
+        "✅ Пользовательский промпт установлен!\n\n"
+        "Теперь все ваши сообщения будут обрабатываться с использованием этого промпта. "
+        "Шаблоны из файла promt_list отключены.\n\n"
+        "Чтобы вернуться к стандартным промптам, используйте команду /prompt"
+    )
+    
+    return ConversationHandler.END
 
 async def save_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1003,6 +1087,8 @@ def main():
     application.add_handler(CommandHandler("prompt", prompt_menu))
     application.add_handler(CommandHandler("ai", ai_menu))
     application.add_handler(CommandHandler("reload_prompts", reload_prompts))
+    application.add_handler(CommandHandler("question", question_cmd))
+    application.add_handler(CommandHandler("stats", stats_cmd))
     
     # Обработчики сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons))
@@ -1022,6 +1108,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)]
     )
     application.add_handler(conv_handler)
+    
+    # Обработчик пользовательского промпта
+    custom_prompt_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(set_prompt_callback, pattern=r"^prompt_admin:")],
+        states={
+            CUSTOM_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_prompt)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    application.add_handler(custom_prompt_handler)
+    
     application.add_handler(CallbackQueryHandler(set_prompt_callback, pattern=r"^set_prompt:"))
     application.add_handler(CallbackQueryHandler(save_pdf_callback, pattern=r"^save_pdf$"))
     application.add_handler(CallbackQueryHandler(set_ai_callback, pattern=r"^set_ai:"))
