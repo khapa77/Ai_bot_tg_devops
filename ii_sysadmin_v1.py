@@ -128,6 +128,10 @@ def _is_region_block_error(err: Exception) -> bool:
         "403" in text and "openai" in text
     )
 
+def _is_insufficient_balance_error(err: Exception) -> bool:
+    text = str(err).lower()
+    return ("402" in text) or ("insufficient" in text and "balance" in text) or ("payment required" in text)
+
 def _fix_json_multiline_strings(text: str) -> str:
     """Грубая попытка исправить многострочные строки в JSON для ключей title/content.
     Заменяет реальные переводы строк внутри кавычек на символы \n.
@@ -538,7 +542,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(ai_response, reply_markup=reply_markup)
         
     except Exception as e:
-        if _is_region_block_error(e):
+        if _is_insufficient_balance_error(e):
+            logger.error(f"Provider insufficient balance: {e}")
+            await update.message.reply_text(
+                "У провайдера недостаточно средств/кредита. Пополните баланс или выберите другого провайдера через /ai."
+            )
+        elif _is_region_block_error(e):
             logger.error(f"OpenAI region restriction: {e}")
             await update.message.reply_text(
                 "Доступ к OpenAI ограничен в вашем регионе. Варианты:\n"
@@ -602,7 +611,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(image_path)
         await update.message.reply_text(response)
     except Exception as e:
-        if _is_region_block_error(e):
+        if _is_insufficient_balance_error(e):
+            logger.error(f"Provider insufficient balance: {e}")
+            await update.message.reply_text(
+                "У провайдера недостаточно средств/кредита. Пополните баланс или выберите другого провайдера через /ai."
+            )
+        elif _is_region_block_error(e):
             logger.error(f"OpenAI region restriction: {e}")
             await update.message.reply_text(
                 "Доступ к OpenAI ограничен в вашем регионе. Перенесите запуск бота в поддерживаемый регион или используйте Azure OpenAI."
