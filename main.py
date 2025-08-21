@@ -50,6 +50,8 @@ HISTORY_LENGTH = 5  # Количество сообщений для конте�
 
 # Состояния для админ-панели
 ADMIN_MENU, VIEW_STATS, BROADCAST = range(3)
+# Состояния для добавления промпта
+PROMPT_ADD_TITLE, PROMPT_ADD_CONTENT = range(100, 102)
 
 # Настройка логгирования
 logging.basicConfig(
@@ -216,6 +218,18 @@ def _load_prompts():
         PROMPTS = [{"id": "default", "title": "Стандартный промпт", "content": default_system_prompt}]
         PROMPT_BY_ID = {"default": PROMPTS[0]}
 
+def _save_prompts() -> None:
+    """Сохранить текущие PROMPTS в файл promt_list в формате JSON-списка."""
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, "promt_list")
+        data = [{"id": p["id"], "title": p["title"], "content": p["content"]} for p in PROMPTS]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info("Промпты сохранены в promt_list")
+    except Exception as e:
+        logger.error(f"Не удалось сохранить promt_list: {e}")
+
 def _get_user_system_prompt(user_id: int) -> str:
     pid = USER_SELECTED_PROMPT.get(user_id)
     if pid and pid in PROMPT_BY_ID:
@@ -249,6 +263,18 @@ try:
     from reportlab.pdfgen import canvas
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+    # Совместимость: устраняем ошибку 'usedforsecurity' для openssl_md5
+    try:
+        from reportlab.lib import utils as rl_utils  # type: ignore
+        import hashlib as _hashlib
+        def _rl_safe_md5(data=b""):
+            try:
+                return _hashlib.md5(data, usedforsecurity=False)
+            except TypeError:
+                return _hashlib.md5(data)
+        rl_utils.rl_md5 = _rl_safe_md5  # type: ignore[attr-defined]
+    except Exception:
+        pass
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -533,6 +559,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     user_message = update.message.text
     
+    # Админский режим добавления промпта (title/content)
+    if context.user_data.get("prompt_admin_action") == "add_title":
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("Доступ запрещен.")
+            context.user_data.pop("prompt_admin_action", None)
+            return
+        context.user_data["new_prompt_title"] = user_message.strip()
+        context.user_data["prompt_admin_action"] = "add_content"
+        await update.message.reply_text("Теперь отправьте текст промпта (content):")
+        return
+    if context.user_data.get("prompt_admin_action") == "add_content":
+        if user_id not in ADMIN_IDS:
+            await update.message.reply_text("Доступ запрещен.")
+            context.user_data.pop("prompt_admin_action", None)
+            context.user_data.pop("new_prompt_title", None)
+            return
+        title = context.user_data.get("new_prompt_title", "Новый промпт").strip()
+        content = user_message
+        # Сохраняем в список и файл
+        new_id_base = re.sub(r"[^a-zA-Z0-9_]", "_", title) or "prompt"
+        new_id = new_id_base
+        suffix = 1
+        existing_ids = {p["id"] for p in PROMPTS}
+        while new_id in existing_ids:
+            suffix += 1
+            new_id = f"{new_id_base}_{suffix}"
+        PROMPTS.append({"id": new_id, "title": title, "content": content})
+        global PROMPT_BY_ID
+        PROMPT_BY_ID = {p["id"]: p for p in PROMPTS}
+        _save_prompts()
+        await update.message.reply_text(f"Промпт добавлен: {title}")
+        context.user_data.pop("prompt_admin_action", None)
+        context.user_data.pop("new_prompt_title", None)
+        return
+
     update_stats(user_id)
     
     # Получаем или создаем контекст пользователя
@@ -698,6 +759,12 @@ async def prompt_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pid = p["id"]
             prefix = "✅ " if USER_SELECTED_PROMPT.get(user_id) == pid else ""
             keyboard.append([InlineKeyboardButton(f"{prefix}{title}", callback_data=f"set_prompt:{pid}")])
+        # Если админ — добавим кнопки управления
+        if user_id in ADMIN_IDS:
+            keyboard.append([
+                InlineKeyboardButton("➕ Добавить", callback_data="prompt_admin:add"),
+                InlineKeyboardButton("➖ Удалить", callback_data="prompt_admin:del")
+            ])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("Выберите промпт:", reply_markup=reply_markup)
     except Exception as e:
@@ -727,16 +794,45 @@ async def set_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     try:
         data = query.data
-        if not data.startswith("set_prompt:"):
+        if data.startswith("set_prompt:"):
+            pid = data.split(":", 1)[1]
+            user_id = query.from_user.id
+            if pid in PROMPT_BY_ID:
+                USER_SELECTED_PROMPT[user_id] = pid
+                title = PROMPT_BY_ID[pid]["title"]
+                await query.edit_message_text(f"Выбран промпт: {title}")
+            else:
+                await query.edit_message_text("Неизвестный промпт.")
             return
-        pid = data.split(":", 1)[1]
-        user_id = query.from_user.id
-        if pid in PROMPT_BY_ID:
-            USER_SELECTED_PROMPT[user_id] = pid
-            title = PROMPT_BY_ID[pid]["title"]
-            await query.edit_message_text(f"Выбран промпт: {title}")
-        else:
-            await query.edit_message_text("Неизвестный промпт.")
+        if data == "prompt_admin:add":
+            if query.from_user.id not in ADMIN_IDS:
+                await query.edit_message_text("Доступ запрещен.")
+                return
+            await query.edit_message_text("Введите заголовок нового промпта (title):")
+            context.user_data["prompt_admin_action"] = "add_title"
+            return
+        if data == "prompt_admin:del":
+            if query.from_user.id not in ADMIN_IDS:
+                await query.edit_message_text("Доступ запрещен.")
+                return
+            # Кнопки для удаления существующих
+            keyboard = []
+            for p in PROMPTS:
+                keyboard.append([InlineKeyboardButton(f"Удалить: {p['title']}", callback_data=f"prompt_admin:del:{p['id']}")])
+            await query.edit_message_text("Выберите промпт для удаления:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        if data.startswith("prompt_admin:del:"):
+            if query.from_user.id not in ADMIN_IDS:
+                await query.edit_message_text("Доступ запрещен.")
+                return
+            del_id = data.split(":", 2)[2]
+            # Удаляем
+            global PROMPTS, PROMPT_BY_ID
+            PROMPTS = [p for p in PROMPTS if p["id"] != del_id]
+            PROMPT_BY_ID = {p["id"]: p for p in PROMPTS}
+            _save_prompts()
+            await query.edit_message_text("Промпт удалён.")
+            return
     except Exception as e:
         logger.error(f"Ошибка выбора промпта: {e}")
         await query.edit_message_text("Не удалось применить промпт.")
