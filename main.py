@@ -167,6 +167,10 @@ def _is_insufficient_balance_error(err: Exception) -> bool:
     text = str(err).lower()
     return ("402" in text) or ("insufficient" in text and "balance" in text) or ("payment required" in text)
 
+def _is_auth_error(err: Exception) -> bool:
+    text = str(err).lower()
+    return ("401" in text) or ("unauthorized" in text) or ("authentication" in text and "invalid" in text)
+
 def _fix_json_multiline_strings(text: str) -> str:
     """Грубая попытка исправить многострочные строки в JSON для ключей title/content.
     Заменяет реальные переводы строк внутри кавычек на символы \n.
@@ -643,7 +647,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(chunk)
         
     except Exception as e:
-        if _is_insufficient_balance_error(e):
+        if _is_auth_error(e):
+            logger.error(f"Provider auth error: {e}")
+            await update.message.reply_text(
+                "Ошибка авторизации у провайдера (401). Обновите ключ в secrets или смените провайдера через /ai."
+            )
+        elif _is_insufficient_balance_error(e):
             logger.error(f"Provider insufficient balance: {e}")
             await update.message.reply_text(
                 "У провайдера недостаточно средств/кредита. Пополните баланс или выберите другого провайдера через /ai."
@@ -712,7 +721,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(image_path)
         await update.message.reply_text(response)
     except Exception as e:
-        if _is_insufficient_balance_error(e):
+        if _is_auth_error(e):
+            logger.error(f"Provider auth error: {e}")
+            await update.message.reply_text(
+                "Ошибка авторизации у провайдера (401). Обновите ключ в secrets или смените провайдера через /ai."
+            )
+        elif _is_insufficient_balance_error(e):
             logger.error(f"Provider insufficient balance: {e}")
             await update.message.reply_text(
                 "У провайдера недостаточно средств/кредита. Пополните баланс или выберите другого провайдера через /ai."
@@ -802,6 +816,7 @@ async def ai_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не удалось загрузить список провайдеров.")
 
 async def set_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PROMPTS, PROMPT_BY_ID
     query = update.callback_query
     await query.answer()
     try:
@@ -839,7 +854,6 @@ async def set_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             del_id = data.split(":", 2)[2]
             # Удаляем
-            global PROMPTS, PROMPT_BY_ID
             PROMPTS = [p for p in PROMPTS if p["id"] != del_id]
             PROMPT_BY_ID = {p["id"]: p for p in PROMPTS}
             _save_prompts()
@@ -987,6 +1001,7 @@ def main():
     application.add_handler(CommandHandler("report", admin_report))
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(CommandHandler("prompt", prompt_menu))
+    application.add_handler(CommandHandler("ai", ai_menu))
     application.add_handler(CommandHandler("reload_prompts", reload_prompts))
     
     # Обработчики сообщений
